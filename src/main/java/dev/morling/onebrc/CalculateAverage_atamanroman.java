@@ -1,3 +1,18 @@
+/*
+ *  Copyright 2023 The original authors
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
 package dev.morling.onebrc;
 
 import java.io.IOException;
@@ -5,173 +20,232 @@ import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
-import java.nio.charset.StandardCharsets;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 public class CalculateAverage_atamanroman {
 
-  private static final String FILE = "./measurements.txt";
-  private static final int CHUNK_SIZE = 2_000_000_000;
+    private static final String FILE = "./measurements.txt";
+    private static final int MAX_CHUNK_SIZE = 2_000_000_000;
 
+    static Map<String, CityTemps> averages = new ConcurrentHashMap<>();
+    static ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-  static Map<String, Avg> averages = new ConcurrentHashMap<>();
-
-  static long lines = 0;
-
-  public static void main(String[] args) throws IOException {
-    long chunkStart = 0;
-    try (RandomAccessFile file = new RandomAccessFile(FILE,
-        "rw"); FileChannel channel = file.getChannel()) {
-      MappedMemoryChunk chunk;
-      while ((chunk = alignChunk(channel, chunkStart, CHUNK_SIZE)) != null) {
-        chunkStart += chunk.size;
-        parseFile(chunk);
-      }
-    }
-    printSummary();
-  }
-
-  /**
-   * Align MappedMemory with the lines.
-   * <p>
-   * Reads back to the last \n and then returns that
-   */
-  private static MappedMemoryChunk alignChunk(FileChannel chan,
-      long chunkStart, final int initialChunkSize) {
-    try {
-      if (chunkStart >= chan.size()) {
-        return null;
-      }
-
-      int actualChunkSize = initialChunkSize;
-      if (actualChunkSize > (chan.size() - chunkStart)) {
-        actualChunkSize = (int) (chan.size() - chunkStart);
-      }
-      MappedByteBuffer chunk = chan.map(MapMode.READ_ONLY, chunkStart, actualChunkSize);
-      int charsBack = seekNewlineBackwards(chunk);
-      actualChunkSize = actualChunkSize - charsBack;
-      chunk.limit(actualChunkSize);
-      return new MappedMemoryChunk(chunk, actualChunkSize);
-    } catch (IOException e) {
-      throw new RuntimeException("Failed to memory map chunk", e);
-    }
-  }
-
-  private static int seekNewlineBackwards(MappedByteBuffer chunk) {
-    int charsBack = 0;
-    while (chunk.get(chunk.limit() - 1 - charsBack) != '\n') {
-      charsBack++;
-    }
-    return charsBack;
-  }
-
-  private static void parseFile(MappedMemoryChunk chunk) {
-    var buf = new byte[chunk.size];
-    chunk.buf.get(buf);
-    int lineStart = 0;
-    int lineBytes = 0;
-    for (int pos = 0; pos < chunk.size; pos++) {
-      byte ch = buf[pos];
-      lineBytes++;
-      if (ch == '\n') {
-        var line = Arrays.copyOfRange(buf, lineStart, lineBytes - 1);
-        var sepPos = findSeparator(line);
-        var city = parseCity(line, sepPos);
-        addReading(city, parseTemp(line, sepPos));
-        lineStart = pos + 1;
-        lines++;
-        if (lines % 100000 == 0) {
-          System.out.printf("Read %d of 1.000.000.000 lines (%f%%)\n", lines,
-              lines / 1_000_000_0.0);
+    public static void main(String[] args) throws IOException, InterruptedException {
+        long chunkStart = 0;
+        try (RandomAccessFile file = new RandomAccessFile(args.length == 1 ? args[0] : FILE,
+                "rw"); FileChannel channel = file.getChannel()) {
+            List<MappedMemoryChunk> chunks = new ArrayList<>(100);
+            MappedMemoryChunk chunk;
+          while ((chunk = alignChunk(channel, chunkStart, efficientChunkSize())) != null) {
+                chunkStart += chunk.size;
+                chunks.add(chunk);
+            }
+            chunks.stream().map(c -> (Runnable) () -> {
+                try {
+                    parseChunk(c);
+                }
+                catch (Throwable e) {
+                    System.out.println("Failed to parse chunk!");
+                    e.printStackTrace();
+                    throw e;
+                }
+            }).forEach(r -> executor.submit(r));
+            executor.shutdown();
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
         }
-      }
+        try {
+            printSummary();
+        }
+        catch (Throwable e) {
+            System.out.println("Failed to print summary!");
+            e.printStackTrace();
+            throw e;
+        }
     }
-  }
 
-  private static int findSeparator(byte[] line) {
-    var split = -1;
-    for (int n = 0; n < line.length; n++) {
-      if (line[n] == ';') {
-        split = n;
-      }
+    private static int efficientChunkSize() {
+        return 1000 * 1000 * 10; // 10mb chunks ~ 1300 virtual threads
     }
-    return split;
-  }
 
-  private static void addReading(String city, double temp) {
-    averages.compute(city, (_, v) -> {
-      if (v == null) {
-        return new Avg(city, temp);
-      } else {
-        v.add(temp);
-        return v;
-      }
-    });
-  }
+    /**
+     * Align MappedMemory with the lines.
+     * <p>
+     * Reads back to the last \n and then returns that
+     */
+    private static MappedMemoryChunk alignChunk(FileChannel chan, long chunkStart,
+                                                final int initialChunkSize) {
+        try {
+            if (chunkStart >= chan.size()) {
+                return null;
+            }
 
-  private static double parseTemp(byte[] line, int split) {
-    return ByteTemp.lookup(Arrays.copyOfRange(line, split + 1, line.length));
-  }
+            int actualChunkSize = initialChunkSize;
+            if (actualChunkSize > (chan.size() - chunkStart)) {
+                actualChunkSize = (int) (chan.size() - chunkStart);
+            }
+            MappedByteBuffer chunk = chan.map(MapMode.READ_ONLY, chunkStart, actualChunkSize);
+            int charsBack = seekNewlineBackwards(chunk);
+            actualChunkSize = actualChunkSize - charsBack;
+            chunk.limit(actualChunkSize);
+            return new MappedMemoryChunk(chunk, actualChunkSize);
+        }
+        catch (IOException e) {
+            throw new RuntimeException("Failed to memory map chunk", e);
+        }
+    }
 
-  private static String parseCity(byte[] line, int split) {
-    return new String(Arrays.copyOfRange(line, 0, split));
-  }
+    private static int seekNewlineBackwards(MappedByteBuffer chunk) {
+        int charsBack = 0;
+        while (chunk.get(chunk.limit() - 1 - charsBack) != '\n') {
+            charsBack++;
+        }
+        return charsBack;
+    }
+
+    private static void parseChunk(MappedMemoryChunk chunk) {
+        var buf = new byte[chunk.size];
+        chunk.buf.get(buf);
+        int lineStart = 0;
+        int lineBytes = 0;
+        for (int pos = 0; pos < chunk.size; pos++) {
+            byte ch = buf[pos];
+            lineBytes++;
+            if (ch == '\n') {
+                var line = Arrays.copyOfRange(buf, lineStart, lineBytes - 1); // don't read the \n
+                var separatorPosition = findSeparator(line);
+                var city = parseCity(line, separatorPosition);
+                addReading(city, parseTemp(line, separatorPosition));
+                lineStart = pos + 1; // skip \n
+            }
+        }
+    }
+
+    private static int findSeparator(byte[] line) {
+        var split = -1;
+        for (int n = 0; n < line.length; n++) {
+            if (line[n] == ';') {
+                split = n;
+            }
+        }
+        return split;
+    }
+
+    private static void addReading(String city, double temp) {
+        averages.compute(city, (_, v) -> {
+            if (v == null) {
+                return new CityTemps(city, temp);
+            }
+            else {
+                synchronized (city) {
+                    v.addReading(temp);
+                    return v;
+                }
+            }
+        });
+    }
+
+    private static double parseTemp(byte[] line, int split) {
+        return ByteTemp.lookup(Arrays.copyOfRange(line, split + 1, line.length));
+    }
+
+    private static String parseCity(byte[] line, int split) {
+        return new String(Arrays.copyOfRange(line, 0, split));
+    }
 
   private static void printSummary() {
-    averages.values().stream().sorted(Comparator.comparing(o -> o.city)).forEachOrdered(avg -> {
-      System.out.println(STR."\{avg.city}: \{avg.calculate()}");
-      System.out.println(STR."(was sum=\{avg.sum}/ count=\{avg.count}");
-    });
+    System.out.print("{");
+    System.out.print(averages.values().stream().map(CityTemps::formatted).sorted()
+        .collect(Collectors.joining(", ")));
+    System.out.print("}");
+    var totalReads = averages.values().stream().mapToLong(cityTemps -> cityTemps.reads).sum();
+    System.out.println(STR."\nRead \{totalReads} lines!");
   }
 
+    static class CityTemps {
 
-  static class Avg {
+        static final DecimalFormat DOUBLE_FORMAT;
 
-    private final String city;
-    private double sum = 0;
-    private long count = 0;
+        static {
+            DOUBLE_FORMAT = (DecimalFormat) NumberFormat.getNumberInstance(Locale.US);
+            DOUBLE_FORMAT.setMinimumFractionDigits(1);
+            DOUBLE_FORMAT.setMaximumFractionDigits(1);
+        }
 
-    public Avg(String city) {
-      this.city = city;
+        private final String city;
+        private double sum = 0;
+        private double min = 0;
+        private double max = 0;
+        private long reads = 0;
+
+        ReentrantLock lock = new ReentrantLock();
+
+        public CityTemps(String city) {
+            this.city = city;
+        }
+
+        public CityTemps(String city, double first) {
+            this(city);
+            min = max = sum = first;
+            reads = 1;
+        }
+
+        void addReading(double temp) {
+            lock.lock();
+            try {
+                sum += temp;
+                reads += 1;
+                if (temp > max) {
+                    max = temp;
+                }
+                if (temp < min) {
+                    min = temp;
+                }
+            }
+            finally {
+                lock.unlock();
+            }
+        }
+
+        public double avg() {
+            return sum / reads;
+        }
+
+    private String formatted() {
+      return STR."\{city}=\{min}/\{DOUBLE_FORMAT.format(avg())}/\{max}";
+    }
     }
 
-    public Avg(String city, double first) {
-      this(city);
-      sum = first;
-      count = 1;
+    record MappedMemoryChunk(MappedByteBuffer buf, int size) {
+
     }
-
-    void add(double temp) {
-      sum += temp;
-      count += 1;
-    }
-
-    public double calculate() {
-      return sum / count;
-    }
-  }
-
-  record MappedMemoryChunk(MappedByteBuffer buf, int size) {
-
-  }
 
   /**
-   * minimal representation of temps in the range of -50.0 to +50.0
+   * minimal representation of temps in the range of -99.9 to 99.9
    */
-  static record ByteTemp(byte one, byte two, byte three, byte four, byte five) {
+  record ByteTemp(byte one, byte two, byte three, byte four, byte five) {
 
-    private static Map<ByteTemp, Double> temps = new HashMap<>();
+    private static final Map<ByteTemp, Double> temps = new HashMap<>();
 
     private static double lookup(byte[] bytes) {
       return switch (bytes.length) {
         case 3 -> temps.get(new ByteTemp(bytes[0], bytes[1], bytes[2]));
         case 4 -> temps.get(new ByteTemp(bytes[0], bytes[1], bytes[2], bytes[3]));
         case 5 -> temps.get(new ByteTemp(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]));
-        default -> throw new IllegalStateException("Invalid temp bytes: " + Arrays.toString(bytes));
+        default ->
+            throw new IllegalStateException(STR."Invalid temp bytes: \{Arrays.toString(bytes)}");
       };
     }
 
@@ -2188,14 +2262,6 @@ public class CalculateAverage_atamanroman {
 
     public ByteTemp(int one, int two, int three, int four, int five) {
       this((byte) one, (byte) two, (byte) three, (byte) four, (byte) five);
-    }
-
-    public ByteTemp(byte one, byte two, byte three, byte four, byte five) {
-      this.one = one;
-      this.two = two;
-      this.three = three;
-      this.four = four;
-      this.five = five;
     }
 
     public static void main(String[] args) {
